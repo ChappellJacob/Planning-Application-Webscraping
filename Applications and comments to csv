@@ -1,0 +1,211 @@
+import os
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import fitz
+import pytesseract
+import pandas as pd
+from PIL import Image
+import logging
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Tesseract command using environment variables
+pytesseract.pytesseract.tesseract_cmd = os.getenv('TESSERACT_CMD')
+
+def set_headers(cookie, referer):
+    #Set headers for the HTTP requests.
+    return {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8,fr;q=0.7',
+        'Cache-Control': 'max-age=0',
+        'Connection': 'keep-alive',
+        'Cookie': cookie,
+        'Host': 'publicaccess.mendip.gov.uk',
+        'Referer': referer,
+        'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    }
+
+def get_cookies(url):
+    #Fetch cookies from the URL.
+    session = requests.Session()
+    response = session.get(url)
+    response.raise_for_status()
+    cookies = session.cookies.get_dict()
+    cookie_string = '; '.join([f"{key}={value}" for key, value in cookies.items()])
+    return cookie_string
+
+def fetch_pdf_content(url, headers):
+    #Fetch PDF content from the URL.
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.content
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch PDF from {url}: {str(e)}")
+        return None
+
+def parse_pdf_links(soup, base_url):
+    #Parse links from soup
+    pdf_links = []
+    object_count = 0
+    support_count = 0
+
+    rows = soup.find_all('tr')
+    for row in rows:
+        columns = row.find_all('td')
+        if len(columns) >= 5:
+            fifth_column_text = columns[4].get_text(strip=True).lower()
+            link = columns[5].find('a', href=lambda href: href and href.endswith('.pdf'))
+            if link:
+                pdf_url = urljoin(base_url, link['href'])
+                filename = columns[4].get_text(strip=True).replace(" ", "_").replace("-", "_") + ".pdf"
+                pdf_links.append((pdf_url, filename))
+                if "objects" in fifth_column_text or "objection" in fifth_column_text:
+                    object_count += 1
+                elif "supports" in fifth_column_text or "support" in fifth_column_text:
+                    support_count += 1
+    return pdf_links, object_count, support_count
+
+def fetch_pdf_links(url, headers):
+    #PDF links from app URL
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        return parse_pdf_links(soup, url)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch {url}: {str(e)}")
+        return [], 0, 0
+
+def ocr_pdf_page(image):
+    #OCR on PDF
+    return pytesseract.image_to_string(image)
+
+def extract_text_from_pdf_content(pdf_content):
+    #Extract text from PDF
+    try:
+        doc = fitz.open(stream=pdf_content, filetype='pdf')
+        text = ""
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text()
+            if not page_text.strip():
+                pix = page.get_pixmap()
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                page_text = ocr_pdf_page(img)
+            text += page_text
+        return text
+    except Exception as e:
+        logging.error(f"Failed to extract text from PDF content: {str(e)}")
+        return ""
+
+def parse_comments(soup):
+    #Parse comments from soup
+    comments = []
+    object_count = 0
+    support_count = 0
+
+    comment_divs = soup.find_all('div', class_='comment')
+    for comment_div in comment_divs:
+        header = comment_div.find('h2')
+        if header:
+            header_text = header.get_text(strip=True).lower()
+            if 'objects' in header_text or 'objection' in header_text:
+                object_count += 1
+            elif 'supports' in header_text or 'support' in header_text:
+                support_count += 1
+
+            if 'objects' in header_text or 'objection' in header_text:
+                name = header.find('span', class_='consultationName').get_text(strip=True)
+                stance = header.find('span', class_='consultationStance').get_text(strip=True)
+                full_name = f"{name} ({stance})"
+                comment_wrappers = comment_div.find_all('div', class_='comment-wrapper')
+                for comment_wrapper in comment_wrappers:
+                    comment_text_div = comment_wrapper.find('div', class_='comment-text')
+                    if comment_text_div:
+                        comment_text = comment_text_div.get_text(strip=True)
+                        comments.append((full_name, comment_text))
+    return comments, object_count, support_count
+
+def fetch_comments(url, headers):
+    comments = []
+    object_count = 0
+    support_count = 0
+    page_number = 1
+
+    while True:
+        paged_url = f"{url}&neighbourCommentsPager.page={page_number}"
+        try:
+            response = requests.get(paged_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            new_comments, new_object_count, new_support_count = parse_comments(soup)
+            if not new_comments:
+                break
+            comments.extend(new_comments)
+            object_count += new_object_count
+            support_count += new_support_count
+            page_number += 1
+        except requests.RequestException as e:
+            logging.error(f"Failed to fetch comments from {paged_url}: {str(e)}")
+            break
+
+    return comments, object_count, support_count
+
+def extract_texts_to_dataframe(pdf_links, headers, comment_url):
+    #Text and comments as dataframe
+    data = []
+    
+    for pdf_url, pdf_filename in pdf_links:
+        pdf_content = fetch_pdf_content(pdf_url, headers)
+        if pdf_content:
+            text = extract_text_from_pdf_content(pdf_content)
+            data.append({"Filename": pdf_filename, "Text": text})
+            logging.info(f"Extracted text from {pdf_filename}")
+
+    comments, object_count, support_count = fetch_comments(comment_url, headers)
+    for comment_name, comment_text in comments:
+        data.append({"Filename": comment_name + ' comment', "Text": comment_text})
+        logging.info(f"Extracted comment from {comment_name}")
+
+    return pd.DataFrame(data), object_count, support_count
+
+if __name__ == "__main__":
+    base_url = os.getenv('BASE_URL')
+    application_url = os.getenv('APPLICATION_URL')
+    comments_url = os.getenv('COMMENTS_URL')
+    full_url = urljoin(base_url, application_url)
+    
+    try:
+        cookie_string = get_cookies(full_url)
+        headers = set_headers(cookie_string, full_url)
+
+        pdf_links, pdf_object_count, pdf_support_count = fetch_pdf_links(full_url, headers)
+        df, comment_object_count, comment_support_count = extract_texts_to_dataframe(pdf_links, headers, comments_url)
+        
+        directory_name = "PDF_Texts"
+        csv_filename = f"{directory_name}.csv"
+        df.to_csv(csv_filename, index=False, encoding='utf-8')
+        logging.info(f"Texts extracted and saved to CSV file named {csv_filename}")
+
+        logging.info(f"Number of PDF files with 'object' or 'objection': {pdf_object_count}")
+        logging.info(f"Number of PDF files with 'support' or 'supports': {pdf_support_count}")
+        logging.info(f"Number of comments with 'object' or 'objection' in header: {comment_object_count}")
+        logging.info(f"Number of comments with 'support' or 'supports' in header: {support_count}")
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
